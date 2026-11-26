@@ -1496,21 +1496,28 @@ struct test_case {
         }
         manifest << "\n";
 
-        // Graph leaves include the unnamed allocation bases behind Q/K/V views and permutations.
-        // Their raw bytes plus ne/nb and the complete case description preserve the exact inputs,
-        // including quantized K/V, without dequantizing or regenerating them.
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            const ggml_tensor * input = ggml_graph_node(gf, i);
-            if (input->op != GGML_OP_NONE || strncmp(input->name, "sent_", 5) == 0) {
-                continue;
+        // ggml_graph contains compute nodes, not ordinary input leaves.  Walk the output's complete
+        // src/view_src tree to include the unnamed allocation bases behind Q/K/V views and permutations.
+        std::set<const ggml_tensor *> visited;
+        int input_index = 0;
+        auto dump_input = [&](auto && self, const ggml_tensor * input) -> void {
+            if (input == nullptr || !visited.insert(input).second) {
+                return;
             }
-            const std::string path = base + ".input-" + std::to_string(i) + ".bin";
+            for (const ggml_tensor * src : input->src) {
+                self(self, src);
+            }
+            self(self, input->view_src);
+            if (input->op != GGML_OP_NONE || strncmp(input->name, "sent_", 5) == 0) {
+                return;
+            }
+            const std::string path = base + ".input-" + std::to_string(input_index) + ".bin";
             std::vector<uint8_t> data(ggml_nbytes(input));
             ggml_backend_tensor_get(input, data.data(), 0, data.size());
             std::ofstream dump(path, std::ios::binary);
             dump.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
             ok = ok && bool(dump);
-            manifest << "input_index=" << i << " file=" << path << " name=" << input->name
+            manifest << "input_index=" << input_index++ << " file=" << path << " name=" << input->name
                      << " type=" << ggml_type_name(input->type) << " nbytes=" << data.size() << " ne=";
             for (int d = 0; d < GGML_MAX_DIMS; ++d) {
                 manifest << (d == 0 ? "" : ",") << input->ne[d];
@@ -1520,7 +1527,8 @@ struct test_case {
                 manifest << (d == 0 ? "" : ",") << input->nb[d];
             }
             manifest << "\n";
-        }
+        };
+        dump_input(dump_input, t1);
         ok = ok && bool(manifest);
         printf("\n[FAILURE_DUMP] %s %s\n", ok ? "captured" : "INCOMPLETE", (base + ".failure.meta").c_str());
     }
