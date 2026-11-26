@@ -1535,7 +1535,7 @@ struct test_case {
 
     // Replay a capture in an isolated run of the same case.  The traversal and numbering exactly
     // match dump_flash_attn_failure; every leaf is overwritten after the normal random initialization.
-    void replay_flash_attn_failure(const ggml_tensor * out) {
+    void replay_flash_attn_failure(ggml_tensor * out) {
         const char * dump_dir = getenv("LLAMA_TEST_FAILURE_REPLAY_DIR");
         if (dump_dir == nullptr || out->op != GGML_OP_FLASH_ATTN_EXT) {
             return;
@@ -1550,13 +1550,13 @@ struct test_case {
         snprintf(hash_string, sizeof(hash_string), "%016" PRIx64, case_hash);
         const std::string base = std::string(dump_dir) + "/fa-" + hash_string;
 
-        std::set<const ggml_tensor *> visited;
+        std::set<ggml_tensor *> visited;
         int input_index = 0;
-        auto replay_input = [&](auto && self, const ggml_tensor * input) -> void {
+        auto replay_input = [&](auto && self, ggml_tensor * input) -> void {
             if (input == nullptr || !visited.insert(input).second) {
                 return;
             }
-            for (const ggml_tensor * src : input->src) {
+            for (ggml_tensor * src : input->src) {
                 self(self, src);
             }
             self(self, input->view_src);
