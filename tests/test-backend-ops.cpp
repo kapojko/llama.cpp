@@ -14019,6 +14019,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Short GQA-6 KV extents isolate the single-partial path (kv=32 => ntiles_KV=1) and the
+    // transition to split-KV accumulation without requiring a model-sized attention input.
+    for (int64_t kv : {32, 64, 128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+
     // qwen35 full-attention shape (head 256, GQA 6, quantized K/V) across the decode/verify band
     // (n_q = 1..8): the RDNA4 band-WMMA path folds the whole GQA group into ncols2 = 8 and splits
     // the KV round-robin, so every width/type must match the CPU reference (GREEDY-PURITY).
