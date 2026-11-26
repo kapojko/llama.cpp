@@ -1411,7 +1411,10 @@ static __global__ void flash_attn_tile(
     constexpr int warp_size  = 32;
     constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
-    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+    // Match the unfolded ncols2=2 K/V tiling in the optional fold.  Besides isolating the
+    // remaining numerical difference from nbatch_K=256 / nbatch_V=32, this keeps the split-P
+    // diagnostic controlled: nbatch_V becomes 8 in both geometries while P is forced to match.
+    constexpr int nbatch_K  = fold_gqa6 ? 64 : ggml_cuda_fattn_tile_get_nbatch_K(DKQ, DV, ncols1*ncols2);
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
