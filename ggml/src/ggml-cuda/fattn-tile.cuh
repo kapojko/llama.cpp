@@ -993,6 +993,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         KQ_max_new[jc0] = KQ_max[jc0];
     }
 
+    // Diagnostic: keep the first two folded F16 accumulator chunks unscaled until their first PV
+    // product is available.  This makes it possible to reproduce the unfolded kernel's rounding
+    // order explicitly: round V*P first, then compute old_VKQ*scale + product with one FMA.
+    constexpr bool fold_defer_rescale = fold_gqa6 && std::is_same_v<T_acc, half2>;
+    static_assert(!fold_gqa6 || cpw == 1, "bad folded GQA-6 columns per warp");
+    static_assert(!fold_defer_rescale || (DVp/2)/warp_size >= 2, "bad folded GQA-6 accumulator count");
+    [[maybe_unused]] float fold_KQ_max_scale = 1.0f;
+
     float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
 
     // KQ = K @ Q matrix multiplication:
@@ -1117,6 +1125,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
             const float KQ_max_scale = expf(KQ_max[jc] - KQ_max_new[jc]);
             KQ_max[jc] = KQ_max_new[jc];
+            if constexpr (fold_defer_rescale) {
+                fold_KQ_max_scale = KQ_max_scale;
+            }
 
             float KQ_sum_add = 0.0f;
 #pragma unroll
@@ -1128,7 +1139,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
             KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
 
-            flash_attn_tile_rescale_VKQ(&VKQ[jc*((DVp/2)/warp_size)], KQ_max_scale, (DVp/2)/warp_size);
+            if constexpr (fold_defer_rescale) {
+                flash_attn_tile_rescale_VKQ(&VKQ[jc*((DVp/2)/warp_size) + 2], KQ_max_scale, (DVp/2)/warp_size - 2);
+            } else {
+                flash_attn_tile_rescale_VKQ(&VKQ[jc*((DVp/2)/warp_size)], KQ_max_scale, (DVp/2)/warp_size);
+            }
         }
 
 #pragma unroll
@@ -1284,7 +1299,18 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    half2 & VKQ_ij = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
+                    if constexpr (fold_gqa6) {
+                        if (k0 == 0 && k1 == 0 && i0/warp_size < 2) {
+                            const half2 scale_h2 = make_half2(fold_KQ_max_scale, fold_KQ_max_scale);
+                            const half2 product = __hmul2(V_k[i0/warp_size], KQ_k[jc_VKQ_0]);
+                            VKQ_ij = __hfma2(VKQ_ij, scale_h2, product);
+                        } else {
+                            VKQ_ij += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                        }
+                    } else {
+                        VKQ_ij += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    }
                 }
             }
         }
