@@ -187,8 +187,15 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
     std::random_device rd;
-    std::mt19937 gen(rd());
+    static const unsigned test_seed = []() {
+        const char * e = getenv("LLAMA_TEST_SEED");
+        return e != nullptr ? unsigned(strtoul(e, nullptr, 10)) : 0u;
+    }();
+    std::mt19937 gen(test_seed != 0 ? test_seed : rd());
     std::uniform_real_distribution<float> dis(min, max);
+    auto next_random = [&]() -> unsigned {
+        return test_seed != 0 ? gen() : rd();
+    };
 
     for (size_t i = 0; i < data_f32.size(); i++) {
         data_f32[i] = dis(gen);
@@ -202,12 +209,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (next_random() % ne3);
+        const int p2 = (next_random() % ne2);
+        const int p1 = (next_random() % ne1);
+        const int p0 = (next_random() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = next_random() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
