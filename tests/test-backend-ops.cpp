@@ -1533,6 +1533,50 @@ struct test_case {
         printf("\n[FAILURE_DUMP] %s %s\n", ok ? "captured" : "INCOMPLETE", (base + ".failure.meta").c_str());
     }
 
+    // Replay a capture in an isolated run of the same case.  The traversal and numbering exactly
+    // match dump_flash_attn_failure; every leaf is overwritten after the normal random initialization.
+    void replay_flash_attn_failure(const ggml_tensor * out) {
+        const char * dump_dir = getenv("LLAMA_TEST_FAILURE_REPLAY_DIR");
+        if (dump_dir == nullptr || out->op != GGML_OP_FLASH_ATTN_EXT) {
+            return;
+        }
+        const std::string case_name = current_op_name + "(" + vars() + ")";
+        uint64_t case_hash = 1469598103934665603ULL;
+        for (const unsigned char c : case_name) {
+            case_hash ^= c;
+            case_hash *= 1099511628211ULL;
+        }
+        char hash_string[17];
+        snprintf(hash_string, sizeof(hash_string), "%016" PRIx64, case_hash);
+        const std::string base = std::string(dump_dir) + "/fa-" + hash_string;
+
+        std::set<const ggml_tensor *> visited;
+        int input_index = 0;
+        auto replay_input = [&](auto && self, const ggml_tensor * input) -> void {
+            if (input == nullptr || !visited.insert(input).second) {
+                return;
+            }
+            for (const ggml_tensor * src : input->src) {
+                self(self, src);
+            }
+            self(self, input->view_src);
+            if (input->op != GGML_OP_NONE || strncmp(input->name, "sent_", 5) == 0) {
+                return;
+            }
+            const std::string path = base + ".input-" + std::to_string(input_index++) + ".bin";
+            std::vector<uint8_t> data(ggml_nbytes(input));
+            std::ifstream dump(path, std::ios::binary);
+            dump.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
+            if (!dump) {
+                fprintf(stderr, "failed to replay flash-attention input: %s\n", path.c_str());
+                GGML_ABORT("incomplete flash-attention failure capture");
+            }
+            ggml_backend_tensor_set(input, data.data(), 0, data.size());
+        };
+        replay_input(replay_input, out);
+        printf("[FAILURE_REPLAY] %s (%d inputs)\n", base.c_str(), input_index);
+    }
+
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
@@ -1630,6 +1674,7 @@ struct test_case {
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
         }
+        replay_flash_attn_failure(out);
 
         // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
         if (backend_lacks_skipped_ids(backend1, gf)) {
