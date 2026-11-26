@@ -1335,7 +1335,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV, bool fold_gqa6 = false> // D == head size
-__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
+__launch_bounds__(fold_gqa6 ? 256 : ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
                        ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
@@ -1409,7 +1409,11 @@ static __global__ void flash_attn_tile(
     constexpr int ncols2_eff = fold_gqa6 ? 6 : ncols2;
     constexpr int ncols1_eff = fold_gqa6 ? 1 : ncols1;
     constexpr int warp_size  = 32;
-    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
+    // Diagnostic geometry: eight warps give each of the six real heads its own warp (cpw=1),
+    // matching the unfolded per-head KQ layout instead of packing two heads into each warp.
+    // Keep this in sync with __launch_bounds__ and the host-side launch geometry below.
+    constexpr int nwarps    = (fold_gqa6 ? 256 :
+        ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2)) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
     // Match the unfolded ncols2=2 K/V tiling in the optional fold.  Besides isolating the
     // remaining numerical difference from nbatch_K=256 / nbatch_V=32, this keeps the split-P
@@ -1462,6 +1466,7 @@ static __global__ void flash_attn_tile(
     constexpr int cpw = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp.
     constexpr int np  = nwarps > ncols ? nwarps/ncols : 1; // Number of parallel warps per Q column.
     static_assert(cpw == 1 || np == 1, "bad cpw / np");
+    static_assert(!fold_gqa6 || (nwarps == 8 && cpw == 1), "bad GQA-6 diagnostic geometry");
     static_assert(nbatch_fa % (np*warp_size) == 0, "nbatch_fa % (np*warp_size) != 0");
 
     constexpr int DKQp = (DKQ + 2*warp_size - 1) & ~(2*warp_size - 1); // DKQ padded to multiple of 2*warp_size.
@@ -1889,7 +1894,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         // verify must use the same cols_per_block here; use the n_q = 1 config.
         // Larger batches (prefill) keep the tuned configs below.
         constexpr int cols_per_block = ncols2 > 2 ? ncols2 : 2;
-        const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+        const int nwarps    = (fold_gqa6 ? 256 :
+            ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, cols_per_block, cc)) / warp_size;
         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, fold_gqa6>;
 
