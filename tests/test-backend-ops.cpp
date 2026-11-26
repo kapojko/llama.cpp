@@ -1454,6 +1454,77 @@ struct test_case {
         return false;
     }
 
+    // LLAMA_TEST_FAILURE_DUMP_DIR=<existing directory> captures the actual randomized inputs and
+    // both outputs when a flash-attention comparison fails.  Do this in the failing process: a
+    // later rerun with the same case filter would generate different inputs unless it was seeded.
+    void dump_flash_attn_failure(const ggml_tensor * t1, const std::vector<float> & f1,
+            const std::vector<float> & f2, const char * reason, size_t error_index) {
+        const char * dump_dir = getenv("LLAMA_TEST_FAILURE_DUMP_DIR");
+        if (dump_dir == nullptr || t1->op != GGML_OP_FLASH_ATTN_EXT) {
+            return;
+        }
+
+        const std::string case_name = current_op_name + "(" + vars() + ")";
+        uint64_t case_hash = 1469598103934665603ULL;
+        for (const unsigned char c : case_name) {
+            case_hash ^= c;
+            case_hash *= 1099511628211ULL;
+        }
+        char hash_string[17];
+        snprintf(hash_string, sizeof(hash_string), "%016" PRIx64, case_hash);
+        const std::string base = std::string(dump_dir) + "/fa-" + hash_string;
+
+        auto dump_floats = [](const std::string & path, const std::vector<float> & values) {
+            std::ofstream dump(path, std::ios::binary);
+            dump.write(reinterpret_cast<const char *>(values.data()),
+                       static_cast<std::streamsize>(values.size()*sizeof(float)));
+            return bool(dump);
+        };
+        bool ok = dump_floats(base + ".device.f32", f1) && dump_floats(base + ".cpu.f32", f2);
+
+        std::ofstream manifest(base + ".failure.meta");
+        manifest << case_name << "\nreason=" << reason << "\nindex=" << error_index << "\n";
+        manifest << "seed=" << (getenv("LLAMA_TEST_SEED") != nullptr ? getenv("LLAMA_TEST_SEED") : "random") << "\n";
+        manifest << "device_output=" << base << ".device.f32\ncpu_output=" << base << ".cpu.f32\n";
+        manifest << "output_ne=";
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            manifest << (d == 0 ? "" : ",") << t1->ne[d];
+        }
+        manifest << "\noutput_nb=";
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            manifest << (d == 0 ? "" : ",") << t1->nb[d];
+        }
+        manifest << "\n";
+
+        // Graph leaves include the unnamed allocation bases behind Q/K/V views and permutations.
+        // Their raw bytes plus ne/nb and the complete case description preserve the exact inputs,
+        // including quantized K/V, without dequantizing or regenerating them.
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            const ggml_tensor * input = gf->nodes[i];
+            if (input->op != GGML_OP_NONE || strncmp(input->name, "sent_", 5) == 0) {
+                continue;
+            }
+            const std::string path = base + ".input-" + std::to_string(i) + ".bin";
+            std::vector<uint8_t> data(ggml_nbytes(input));
+            ggml_backend_tensor_get(input, data.data(), 0, data.size());
+            std::ofstream dump(path, std::ios::binary);
+            dump.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+            ok = ok && bool(dump);
+            manifest << "input_index=" << i << " file=" << path << " name=" << input->name
+                     << " type=" << ggml_type_name(input->type) << " nbytes=" << data.size() << " ne=";
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                manifest << (d == 0 ? "" : ",") << input->ne[d];
+            }
+            manifest << " nb=";
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                manifest << (d == 0 ? "" : ",") << input->nb[d];
+            }
+            manifest << "\n";
+        }
+        ok = ok && bool(manifest);
+        printf("\n[FAILURE_DUMP] %s %s\n", ok ? "captured" : "INCOMPLETE", (base + ".failure.meta").c_str());
+    }
+
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
@@ -1562,6 +1633,7 @@ struct test_case {
         // compare
         struct callback_userdata {
             bool   ok;
+            bool   failure_dumped;
             test_case * tc;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
@@ -1569,6 +1641,7 @@ struct test_case {
 
         callback_userdata ud {
             true,
+            false,
             this,
             backend1,
             backend2,
@@ -1595,6 +1668,12 @@ struct test_case {
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
+            auto capture_failure = [&](const char * reason, size_t error_index) {
+                if (!ud->failure_dumped) {
+                    ud->failure_dumped = true;
+                    ud->tc->dump_flash_attn_failure(t1, f1, f2, reason, error_index);
+                }
+            };
 
             // LLAMA_TEST_DUMP_DIR=<existing directory> saves each device-side flash-attention
             // result as raw little-endian float32 plus a metadata sidecar.  The filename is a
@@ -1639,6 +1718,7 @@ struct test_case {
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
                     printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
                     ud->ok = false;
+                    capture_failure("nan", i);
                     return true;
                 }
                 // check for infs: both must be inf of the same sign, or both must be finite
@@ -1647,11 +1727,13 @@ struct test_case {
                         if (std::signbit(f1[i]) != std::signbit(f2[i])) {
                             printf("[%s] inf sign mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
                             ud->ok = false;
+                            capture_failure("inf-sign-mismatch", i);
                             return true;
                         }
                     } else {
                         printf("[%s] inf mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
                         ud->ok = false;
+                        capture_failure("inf-mismatch", i);
                         return true;
                     }
                 }
@@ -1723,6 +1805,7 @@ struct test_case {
                     printf("\n");
                 }
                 ud->ok = false;
+                capture_failure("nmse", f1.size());
             }
             return true;
 
