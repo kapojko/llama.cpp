@@ -1589,6 +1589,44 @@ struct test_case {
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            // LLAMA_TEST_DUMP_DIR=<existing directory> saves each device-side flash-attention
+            // result as raw little-endian float32 plus a metadata sidecar.  The filename is a
+            // stable hash of the complete case description, so separate processes with identical
+            // inputs (set LLAMA_TEST_SEED) can be compared byte-for-byte without changing the op.
+            const char * dump_dir = getenv("LLAMA_TEST_DUMP_DIR");
+            if (dump_dir != nullptr && t1->op == GGML_OP_FLASH_ATTN_EXT) {
+                const std::string case_name = ud->tc->current_op_name + "(" + ud->tc->vars() + ")";
+                uint64_t case_hash = 1469598103934665603ULL;
+                for (const unsigned char c : case_name) {
+                    case_hash ^= c;
+                    case_hash *= 1099511628211ULL;
+                }
+                char hash_string[17];
+                snprintf(hash_string, sizeof(hash_string), "%016" PRIx64, case_hash);
+                const std::string base = std::string(dump_dir) + "/fa-" + hash_string;
+
+                std::ofstream dump(base + ".f32", std::ios::binary);
+                dump.write(reinterpret_cast<const char *>(f1.data()),
+                           static_cast<std::streamsize>(f1.size()*sizeof(float)));
+                std::ofstream meta(base + ".meta");
+                meta << case_name << "\nbackend=" << bn1 << "\n";
+                meta << "ne=";
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    meta << (d == 0 ? "" : ",") << t1->ne[d];
+                }
+                meta << "\nnb=";
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    meta << (d == 0 ? "" : ",") << t1->nb[d];
+                }
+                meta << "\nfloat_count=" << f1.size() << "\n";
+                if (!dump || !meta) {
+                    printf("[%s] failed to dump raw output to %s ", ggml_op_desc(t1), base.c_str());
+                    ud->ok = false;
+                    return true;
+                }
+                printf("[DUMP] %s.f32\n", base.c_str());
+            }
+
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
