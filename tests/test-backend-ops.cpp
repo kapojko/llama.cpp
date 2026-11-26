@@ -1549,6 +1549,9 @@ struct test_case {
         char hash_string[17];
         snprintf(hash_string, sizeof(hash_string), "%016" PRIx64, case_hash);
         const std::string base = std::string(dump_dir) + "/fa-" + hash_string;
+        if (!std::ifstream(base + ".failure.meta")) {
+            return; // This capture belongs to another case.
+        }
 
         std::set<ggml_tensor *> visited;
         int input_index = 0;
