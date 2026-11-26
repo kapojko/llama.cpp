@@ -993,9 +993,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         KQ_max_new[jc0] = KQ_max[jc0];
     }
 
-    // Diagnostic: keep the first two folded F16 accumulator chunks unscaled until their first PV
-    // product is available.  This makes it possible to reproduce the unfolded kernel's rounding
-    // order explicitly: round V*P first, then compute old_VKQ*scale + product with one FMA.
+    // Match the unfolded kernel's F16 rounding order: round V*P first, then compute
+    // old_VKQ*scale + product with one FMA for the first two accumulator chunks.
     constexpr bool fold_defer_rescale = fold_gqa6 && std::is_same_v<T_acc, half2>;
     static_assert(!fold_gqa6 || cpw == 1, "bad folded GQA-6 columns per warp");
     static_assert(!fold_defer_rescale || (DVp/2)/warp_size >= 2, "bad folded GQA-6 accumulator count");
@@ -1299,8 +1298,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                    half2 & VKQ_ij = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
                     if constexpr (fold_gqa6) {
+                        half2 & VKQ_ij = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
                         if (k0 == 0 && k1 == 0 && i0/warp_size < 2) {
                             const half2 scale_h2 = make_half2(fold_KQ_max_scale, fold_KQ_max_scale);
                             const half2 product = __hmul2(V_k[i0/warp_size], KQ_k[jc_VKQ_0]);
@@ -1309,7 +1308,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                             VKQ_ij += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
                         }
                     } else {
-                        VKQ_ij += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
                     }
                 }
             }
@@ -1435,15 +1434,12 @@ static __global__ void flash_attn_tile(
     constexpr int ncols2_eff = fold_gqa6 ? 6 : ncols2;
     constexpr int ncols1_eff = fold_gqa6 ? 1 : ncols1;
     constexpr int warp_size  = 32;
-    // Diagnostic geometry: eight warps give each of the six real heads its own warp (cpw=1),
-    // matching the unfolded per-head KQ layout instead of packing two heads into each warp.
-    // Keep this in sync with __launch_bounds__ and the host-side launch geometry below.
+    // Eight warps give each of the six real heads its own warp (cpw=1), matching the
+    // unfolded per-head KQ layout. Keep this in sync with __launch_bounds__ and the host launcher.
     constexpr int nwarps    = (fold_gqa6 ? 256 :
         ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2)) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
-    // Match the unfolded ncols2=2 K/V tiling in the optional fold.  Besides isolating the
-    // remaining numerical difference from nbatch_K=256 / nbatch_V=32, this keeps the split-P
-    // diagnostic controlled: nbatch_V becomes 8 in both geometries while P is forced to match.
+    // Match the unfolded ncols2=2 K/V tiling, including nbatch_V=8 and its split-KV reduction geometry.
     constexpr int nbatch_K  = fold_gqa6 ? 64 : ggml_cuda_fattn_tile_get_nbatch_K(DKQ, DV, ncols1*ncols2);
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
@@ -1492,7 +1488,7 @@ static __global__ void flash_attn_tile(
     constexpr int cpw = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp.
     constexpr int np  = nwarps > ncols ? nwarps/ncols : 1; // Number of parallel warps per Q column.
     static_assert(cpw == 1 || np == 1, "bad cpw / np");
-    static_assert(!fold_gqa6 || (nwarps == 8 && cpw == 1), "bad GQA-6 diagnostic geometry");
+    static_assert(!fold_gqa6 || (nwarps == 8 && cpw == 1), "bad folded GQA-6 geometry");
     static_assert(nbatch_fa % (np*warp_size) == 0, "nbatch_fa % (np*warp_size) != 0");
 
     constexpr int DKQp = (DKQ + 2*warp_size - 1) & ~(2*warp_size - 1); // DKQ padded to multiple of 2*warp_size.
@@ -1888,6 +1884,37 @@ static __global__ void flash_attn_tile(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+// Reproduce the ordinary launcher's split-KV choice for the unfolded reference geometry.
+static inline int ggml_cuda_fattn_tile_gqa6_pick_parallel_blocks(
+        const int max_blocks_per_sm, const int nsm, const int ntiles_dst_eff, const int ntiles_KV) {
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    const auto pick_parallel_blocks = [&](const int limit) {
+        int pb = std::min(max_blocks_per_sm, limit);
+        int nwaves_best = 0;
+        int efficiency_percent_best = 0;
+        for (int parallel_blocks_test = pb; parallel_blocks_test <= limit; ++parallel_blocks_test) {
+            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
+            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                break;
+            }
+            if (efficiency_percent > efficiency_percent_best) {
+                nwaves_best = nwaves;
+                efficiency_percent_best = efficiency_percent;
+                pb = parallel_blocks_test;
+            }
+        }
+        return pb;
+    };
+    static const bool split_const = [] {
+        const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const int limit = split_const ? blocks_per_wave : ntiles_KV;
+    return std::min(pick_parallel_blocks(limit), ntiles_KV);
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV, bool fold_gqa6 = false>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1949,15 +1976,15 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int unfolded_ntiles_z_gqa = (gqa_ratio + unfolded_ncols2 - 1) / unfolded_ncols2;
             const int unfolded_ntiles_dst_eff = unfolded_ntiles_z_gqa * K->ne[2] * Q->ne[3];
             const int unfolded_ntiles_KV = (K->ne[1] + unfolded_nbatch_fa - 1) / unfolded_nbatch_fa;
-            force_parallel_blocks = ggml_cuda_fattn_pick_parallel_blocks(
-                unfolded_max_blocks_per_sm, nsm, unfolded_ntiles_dst_eff, unfolded_ntiles_KV, true);
+            force_parallel_blocks = ggml_cuda_fattn_tile_gqa6_pick_parallel_blocks(
+                unfolded_max_blocks_per_sm, nsm, unfolded_ntiles_dst_eff, unfolded_ntiles_KV);
         }
 
         // The q_h2 argument must mirror the kernel-side q_global condition
         // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64): the wide RDNA2 kernels
         // read Q from the Q_h2 global half2 buffer, and omitting the argument here (default
         // false) passed a null pointer to the kernel -> illegal memory access (decode band).
-        launch_fattn<DV, cols_per_block/ncols2, ncols2>
+        launch_fattn<DV, cols_per_block/ncols2, ncols2, fold_gqa6>
             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
             need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
             /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64,
