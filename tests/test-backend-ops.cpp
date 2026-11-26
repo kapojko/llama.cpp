@@ -1499,8 +1499,8 @@ struct test_case {
         // Graph leaves include the unnamed allocation bases behind Q/K/V views and permutations.
         // Their raw bytes plus ne/nb and the complete case description preserve the exact inputs,
         // including quantized K/V, without dequantizing or regenerating them.
-        for (int i = 0; i < gf->n_nodes; ++i) {
-            const ggml_tensor * input = gf->nodes[i];
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * input = ggml_graph_node(gf, i);
             if (input->op != GGML_OP_NONE || strncmp(input->name, "sent_", 5) == 0) {
                 continue;
             }
