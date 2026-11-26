@@ -1889,6 +1889,35 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, fold_gqa6>;
+
+        int force_parallel_blocks = 0;
+        if constexpr (fold_gqa6) {
+            // P determines which KV rows share each half2 accumulator and the order in which the
+            // partials are combined.  Reproduce the unfolded ncols2=2 kernel's P so the fold keeps
+            // the existing per-head reduction geometry instead of selecting a new one from its own
+            // occupancy and smaller destination-tile count.
+            constexpr int unfolded_ncols2 = 2;
+            fattn_kernel_t unfolded_kernel =
+                flash_attn_tile<DKQ, DV, 1, unfolded_ncols2, use_logit_softcap, type_KV, false>;
+            const int unfolded_nwarps =
+                ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, unfolded_ncols2, cc) / warp_size;
+            const int unfolded_nbatch_fa =
+                ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, unfolded_ncols2, cc);
+
+            int unfolded_max_blocks_per_sm = 1;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &unfolded_max_blocks_per_sm, unfolded_kernel, unfolded_nwarps*warp_size, nbytes_shared));
+            GGML_ASSERT(unfolded_max_blocks_per_sm > 0);
+
+            const int nsm = ggml_cuda_info().devices[id].nsm;
+            const int gqa_ratio = Q->ne[2] / K->ne[2];
+            const int unfolded_ntiles_z_gqa = (gqa_ratio + unfolded_ncols2 - 1) / unfolded_ncols2;
+            const int unfolded_ntiles_dst_eff = unfolded_ntiles_z_gqa * K->ne[2] * Q->ne[3];
+            const int unfolded_ntiles_KV = (K->ne[1] + unfolded_nbatch_fa - 1) / unfolded_nbatch_fa;
+            force_parallel_blocks = ggml_cuda_fattn_pick_parallel_blocks(
+                unfolded_max_blocks_per_sm, nsm, unfolded_ntiles_dst_eff, unfolded_ntiles_KV, true);
+        }
+
         // The q_h2 argument must mirror the kernel-side q_global condition
         // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64): the wide RDNA2 kernels
         // read Q from the Q_h2 global half2 buffer, and omitting the argument here (default
@@ -1896,7 +1925,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         launch_fattn<DV, cols_per_block/ncols2, ncols2>
             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
             need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-            /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64);
+            /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64,
+            /*can_chunk*/ false, force_parallel_blocks);
         return;
     }
 

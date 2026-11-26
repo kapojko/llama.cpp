@@ -1783,6 +1783,52 @@ static __global__ void flash_attn_q_to_half2(
     }
 }
 
+// Select the number of split-KV blocks for an ordinary (non-stream-K) launch.  Besides controlling
+// parallelism, P determines the KV-to-partial assignment and the combine order, so it is part of the
+// numerical reduction geometry.  The optional GQA-6 fold uses this helper with the unfolded kernel's
+// occupancy and destination-tile count to preserve that geometry.
+static inline int ggml_cuda_fattn_pick_parallel_blocks(
+        const int max_blocks_per_sm, const int nsm, const int ntiles_dst_eff,
+        const int ntiles_KV, const bool decode_verify_band) {
+    // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+    // Test whether parallel_blocks can be set to a higher value for better efficiency.
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    const auto pick_parallel_blocks = [&](const int limit) {
+        int pb = std::min(max_blocks_per_sm, limit);
+        int nwaves_best = 0;
+        int efficiency_percent_best = 0;
+        for (int parallel_blocks_test = pb; parallel_blocks_test <= limit; ++parallel_blocks_test) {
+            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
+            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+
+            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                break;
+            }
+
+            if (efficiency_percent > efficiency_percent_best) {
+                nwaves_best = nwaves;
+                efficiency_percent_best = efficiency_percent;
+                pb = parallel_blocks_test;
+            }
+        }
+        return pb;
+    };
+
+    // GGML_CUDA_FA_SPLIT_CONST=0 restores the old ntiles_KV-driven search (the A/B arm for issue #330;
+    // it is the path that lets a verify batch and the same row's decode choose different splits).
+    static const bool split_const = [] {
+        const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (decode_verify_band && split_const) {
+        // One full wave is the saturation point the search would reach at any depth past it.
+        return std::min(pick_parallel_blocks(blocks_per_wave), ntiles_KV);
+    }
+    return std::min(pick_parallel_blocks(ntiles_KV), ntiles_KV);
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1792,7 +1838,9 @@ void launch_fattn(
     // wip/fa-stage-chunking (TODO #114): the driven kernel supports the per-row PARTIAL contract, so
     // GGML_CUDA_FA_STAGE_CHUNK may launch this op one KV chunk at a time.  Only the MMA prefill kernel
     // passes true (the tile/vec kernels keep their single whole-prefix launch).
-    const bool can_chunk = false
+    const bool can_chunk = false,
+    // Exact split-KV override for the optional GQA-6 fold; zero retains the ordinary heuristic.
+    const int force_parallel_blocks = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -2419,42 +2467,11 @@ void launch_fattn(
         const bool decode_verify_band = Q->ne[1] <= 8;
         const int ntiles_dst_eff = decode_verify_band ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
 
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        const auto pick_parallel_blocks = [&](const int limit) {
-            int pb = std::min(max_blocks_per_sm, limit);
-            int nwaves_best = 0;
-            int efficiency_percent_best = 0;
-            for (int parallel_blocks_test = pb; parallel_blocks_test <= limit; ++parallel_blocks_test) {
-                const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
-                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
-
-                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                    break;
-                }
-
-                if (efficiency_percent > efficiency_percent_best) {
-                    nwaves_best = nwaves;
-                    efficiency_percent_best = efficiency_percent;
-                    pb = parallel_blocks_test;
-                }
-            }
-            return pb;
-        };
-        // GGML_CUDA_FA_SPLIT_CONST=0 restores the old ntiles_KV-driven search (the A/B arm for issue #330;
-        // it is the path that lets a verify batch and the same row's decode choose different splits).
-        static const bool split_const = [] {
-            const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
-            return e == nullptr || atoi(e) != 0;
-        }();
-        if (decode_verify_band && split_const) {
-            // one full wave is the saturation point the search would reach at any depth past it
-            parallel_blocks = std::min(pick_parallel_blocks(blocks_per_wave), ntiles_KV);
+        if (force_parallel_blocks > 0) {
+            parallel_blocks = std::min(force_parallel_blocks, ntiles_KV);
         } else {
-            parallel_blocks = std::min(pick_parallel_blocks(ntiles_KV), ntiles_KV);
+            parallel_blocks = ggml_cuda_fattn_pick_parallel_blocks(
+                max_blocks_per_sm, nsm, ntiles_dst_eff, ntiles_KV, decode_verify_band);
         }
 
         blocks_num.x = ntiles_x;
