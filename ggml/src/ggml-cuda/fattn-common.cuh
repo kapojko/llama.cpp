@@ -1783,7 +1783,7 @@ static __global__ void flash_attn_q_to_half2(
     }
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool force_split = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
@@ -1792,7 +1792,9 @@ void launch_fattn(
     // wip/fa-stage-chunking (TODO #114): the driven kernel supports the per-row PARTIAL contract, so
     // GGML_CUDA_FA_STAGE_CHUNK may launch this op one KV chunk at a time.  Only the MMA prefill kernel
     // passes true (the tile/vec kernels keep their single whole-prefix launch).
-    const bool can_chunk = false
+    const bool can_chunk = false,
+    // Used only when force_split is true; ordinary launches compile this override out.
+    const int forced_parallel_blocks = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -2450,7 +2452,9 @@ void launch_fattn(
             const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
             return e == nullptr || atoi(e) != 0;
         }();
-        if (decode_verify_band && split_const) {
+        if constexpr (force_split) {
+            parallel_blocks = std::min(forced_parallel_blocks, ntiles_KV);
+        } else if (decode_verify_band && split_const) {
             // one full wave is the saturation point the search would reach at any depth past it
             parallel_blocks = std::min(pick_parallel_blocks(blocks_per_wave), ntiles_KV);
         } else {

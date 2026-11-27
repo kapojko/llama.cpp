@@ -11549,6 +11549,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Head-256 GQA-6 covers the padded tile fold at widths 1..8, its inert boundary at widths 9..16,
+    // a deep KV cache, and the derived-mask form used by dense qwen35 models.
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t nh : { 8, 4 }) {
+            for (int kv : { 512, 1024, 4096 }) {
+                for (int nb : { 1, 2, 4, 5, 8, 9, 16 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                    type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, false, kv == 4096));
+                }
+            }
+            for (int nb : { 1, 4, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                type_KV, type_KV));
+            }
+            for (int kv : { 512, 4096 }) {
+                for (int nb : { 1, 8 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                    type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true));
+                }
+            }
+        }
+    }
     // the band itself: a 32768-cell cache is past the auto gate's crossover for every ratio in the class, and bf16
     // is the band's third native K/V type (`GGML_HIP_FA_BAND_WMMA_H128=0` runs these through the tile kernel)
     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_BF16 }) {

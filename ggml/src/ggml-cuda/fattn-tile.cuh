@@ -1775,6 +1775,32 @@ static __global__ void flash_attn_tile(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+// The padded GQA-6 fold is isolated in fattn-tile-gqa6-fold.cuh, compiled only in the dedicated
+// HIP-only TU fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu. The ordinary tile kernels and launchers above
+// are unmodified baseline; only this host dispatch references the fold, gated by RDNA3 + an env opt-in
+// (GGML_HIP_FA_TILE_GQA6_FOLD, default OFF).
+template <bool use_logit_softcap>
+void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+extern template void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<false>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+extern template void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<true >(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+static inline bool ggml_cuda_fattn_tile_gqa6_fold_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_FA_TILE_GQA6_FOLD");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static inline void ggml_cuda_fattn_tile_gqa6_fold_census(const int cc, const int n_q) {
+    static const bool logged = [cc, n_q] {
+        GGML_LOG_INFO("%s: padded GQA-6 tile fold ON (cc 0x%x, n_q %d, ncols1 1 / ncols2 8)\n", __func__, cc, n_q);
+        return true;
+    }();
+    (void) logged;
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1950,6 +1976,17 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     // occupancy fallback keeps >= 1 block resident even when the kernel spills scratch -- and a GQA-8
     // D=128 decode was re-reading the KV cache 4x for it.  The cap is lifted (r334, PR #338 -> folded
     // into block 05), so RDNA2 takes the same ncols2 the rest of the archs do.
+
+#ifdef GGML_USE_HIP
+    if constexpr (DKQ == 256 && DV == 256 && type_KV == GGML_TYPE_Q8_0) {
+        if (GGML_CUDA_CC_IS_RDNA3_0(device_cc) && ggml_cuda_fattn_tile_gqa6_fold_enabled() && use_gqa_opt &&
+                Q->ne[1] <= 8 && gqa_ratio == 6) {
+            ggml_cuda_fattn_tile_gqa6_fold_census(device_cc, Q->ne[1]);
+            ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<use_logit_softcap>(ctx, dst);
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
